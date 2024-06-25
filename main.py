@@ -87,43 +87,65 @@ def convert_to_seconds(time_str):
         time_obj = datetime.strptime(time_str, '%H:%M:%S')
         return time_obj.hour * 3600 + time_obj.minute * 60 + time_obj.second
     except ValueError:
-        time_obj = datetime.strptime(time_str, '%M:%S')
-        return time_obj.minute * 60 + time_obj.second
+        try:
+            time_obj = datetime.strptime(time_str, '%M:%S')
+            return time_obj.minute * 60 + time_obj.second
+        except ValueError:
+            raise ValueError(f"Time format for {time_str} is incorrect")
 
 
-def ffmpeg_extract_subclip(input_file, start_time, end_time, targetname):
+def ffmpeg_extract_subclip(input_file, start_time, duration, targetname):
     command = [
         "ffmpeg", "-y",
         "-i", input_file,
         "-ss", str(start_time),
-        "-to", str(end_time),
+        "-t", str(duration),
         "-c", "copy",
-        "-map", "0:v:0",
-        "-map", "0:a:0",
         targetname
     ]
     subprocess.run(command, check=True)
 
 
 def process_video(video_path, speakerlist, output_folder):
-    speakers = speakerlist  # speakerlist is already a dictionary
-    previous_time = '00:00'
+    speakers = list(speakerlist.items())
     count = {}
 
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    for time, speaker in speakers.items():
-        start_time = convert_to_seconds(previous_time)
-        end_time = convert_to_seconds(time)
-        speaker_key = speaker.replace(" ", "_").replace("(", "").replace(")", "")
+    for i in range(len(speakers)):
+        current_time, current_speaker = speakers[i]
+        start_time = convert_to_seconds(current_time)
+
+        if i < len(speakers) - 1:
+            next_time = speakers[i + 1][0]
+            end_time = convert_to_seconds(next_time)
+        else:
+            end_time = None  # If it's the last speaker, we don't have an end time
+
+        duration = end_time - start_time if end_time else None
+        speaker_key = current_speaker.replace(" ", "_").replace("(", "").replace(")", "")
+
         if speaker_key not in count:
             count[speaker_key] = 0
         count[speaker_key] += 1
+
         clip_filename = f"{output_folder}/{count[speaker_key]:02d}_{speaker_key}.mp4"
-        ffmpeg_extract_subclip(video_path, start_time, end_time, clip_filename)
+
+        if duration:
+            ffmpeg_extract_subclip(video_path, start_time, duration, clip_filename)
+        else:
+            # Handle the case where it's the last segment and we don't have an end time
+            command = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-ss", str(start_time),
+                "-c", "copy",
+                clip_filename
+            ]
+            subprocess.run(command, check=True)
+
         logger.info(f"Processed clip: {clip_filename}")
-        previous_time = time
 
 
 def upload_to_digitalocean(filename, folder):
@@ -175,9 +197,10 @@ def process_entries():
                 download_link = entry.download
                 spaces_folder = entry.spacesfolder
                 video_filename = "video.mp4"
+                speakerlist = entry.speakerlist  # Assuming speakerlist is already a dictionary
 
                 download_video(download_link, video_filename)
-                process_video(video_filename, entry.speakerlist, spaces_folder)
+                process_video(video_filename, speakerlist, spaces_folder)
 
                 for file in os.listdir(spaces_folder):
                     upload_to_digitalocean(os.path.join(spaces_folder, file), spaces_folder)
@@ -190,8 +213,8 @@ def process_entries():
                 for file in os.listdir(spaces_folder):
                     cleanup_files([os.path.join(spaces_folder, file)])
             else:
-                logger.info("No  unprocessed entries found.")
-                break
+                logger.info("No unprocessed entries found.")
+                break  # Exit the loop if no unprocessed entries are found
         except Exception as e:
             logger.error(f"Error in processing entries: {e}")
             time.sleep(60)  # Wait for a minute before retrying
@@ -199,11 +222,11 @@ def process_entries():
 
 def main():
     process_entries()  # Run immediately
-    schedule.every().hour.do(process_entries)
+    schedule.every().hour.do(process_entries)  # Schedule to run every hour
 
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        schedule.run_pending()  # Check if there's any scheduled task pending to run
+        time.sleep(1)  # Sleep for 1 second to avoid busy-waiting
 
 
 if __name__ == "__main__":
