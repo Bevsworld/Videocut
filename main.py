@@ -50,19 +50,34 @@ client = session.client('s3',
                         aws_access_key_id=DO_SPACES_ACCESS_KEY,
                         aws_secret_access_key=DO_SPACES_SECRET_KEY)
 
-# Create a database session
-Session = scoped_session(sessionmaker(bind=engine))
-db_session = Session()
+
+def create_db_session():
+    Session = scoped_session(sessionmaker(bind=engine))
+    return Session()
 
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5),
        retry=retry_if_exception_type((SQLAlchemyError, OperationalError)))
-def get_unprocessed_entry():
+def get_unprocessed_entry(db_session):
     try:
-        return db_session.query(riksdagen_table).filter_by(uploadedtospaces=False).first()
+        logger.info("Attempting to fetch an unprocessed entry from the database.")
+        entry = db_session.query(riksdagen_table).filter_by(uploadedtospaces=False).first()
+        if entry:
+            logger.info(f"Fetched entry: {entry.title}")
+        else:
+            logger.info("No unprocessed entries found.")
+        return entry
     except SQLAlchemyError as e:
         db_session.rollback()
-        logger.error(f"Error fetching unprocessed entry: {e}")
+        logger.error(f"SQLAlchemyError while fetching unprocessed entry: {e}")
+        raise
+    except OperationalError as e:
+        db_session.rollback()
+        logger.error(f"OperationalError while fetching unprocessed entry: {e}")
+        raise
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"Unexpected error while fetching unprocessed entry: {e}")
         raise
 
 
@@ -164,7 +179,7 @@ def upload_to_digitalocean(filename, folder):
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5),
        retry=retry_if_exception_type((SQLAlchemyError, PendingRollbackError, OperationalError)))
-def update_entry_to_uploaded(entry_id):
+def update_entry_to_uploaded(db_session, entry_id):
     try:
         stmt = update(riksdagen_table).where(riksdagen_table.c.id == entry_id).values(uploadedtospaces=True)
         db_session.execute(stmt)
@@ -189,35 +204,36 @@ def cleanup_files(files):
 
 
 def process_entries():
-    while True:
-        try:
-            entry = get_unprocessed_entry()
-            if entry:
-                logger.info(f"Processing entry: {entry.title}")
-                download_link = entry.download
-                spaces_folder = entry.spacesfolder
-                video_filename = "video.mp4"
-                speakerlist = entry.speakerlist  # Assuming speakerlist is already a dictionary
+    db_session = create_db_session()
+    try:
+        entry = get_unprocessed_entry(db_session)
+        if entry:
+            logger.info(f"Processing entry: {entry.title}")
+            download_link = entry.download
+            spaces_folder = entry.spacesfolder
+            video_filename = "video.mp4"
+            speakerlist = entry.speakerlist  # Assuming speakerlist is already a dictionary
 
-                download_video(download_link, video_filename)
-                process_video(video_filename, speakerlist, spaces_folder)
+            download_video(download_link, video_filename)
+            process_video(video_filename, speakerlist, spaces_folder)
 
-                for file in os.listdir(spaces_folder):
-                    upload_to_digitalocean(os.path.join(spaces_folder, file), spaces_folder)
+            for file in os.listdir(spaces_folder):
+                upload_to_digitalocean(os.path.join(spaces_folder, file), spaces_folder)
 
-                update_entry_to_uploaded(entry.id)
-                logger.info(f"Entry {entry.title} processed and uploaded.")
+            update_entry_to_uploaded(db_session, entry.id)
+            logger.info(f"Entry {entry.title} processed and uploaded.")
 
-                # Clean up files
-                cleanup_files([video_filename])
-                for file in os.listdir(spaces_folder):
-                    cleanup_files([os.path.join(spaces_folder, file)])
-            else:
-                logger.info("No unprocessed entries found.")
-                break  # Exit the loop if no unprocessed entries are found
-        except Exception as e:
-            logger.error(f"Error in processing entries: {e}")
-            time.sleep(60)  # Wait for a minute before retrying
+            # Clean up files
+            cleanup_files([video_filename])
+            for file in os.listdir(spaces_folder):
+                cleanup_files([os.path.join(spaces_folder, file)])
+        else:
+            logger.info("No unprocessed entries found.")
+    except Exception as e:
+        logger.error(f"Error in processing entries: {e}")
+    finally:
+        db_session.close()  # Ensure the session is closed
+        logger.info("Database session closed.")
 
 
 def main():
